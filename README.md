@@ -30,9 +30,16 @@ python3 app.py --db ./data.db --port 8316
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `POST /api/items/{id}/extensions`，工程人员提交延期申请（`new_deadline`、`reason`）
+- `GET /api/items/{id}/extensions`
+- `POST /api/items/{id}/extensions/{eid}/decision`，负责人审批（`decision`为`approve`或`reject`）
 - `GET /api/audit`
 
 允许角色：inspector, dam_engineer, emergency_manager, viewer。异常值比控制阈值越高，缺陷优先级越高；应急处置缺陷必须完成复检并记录证据后才能关闭。
+
+## 延期审批
+
+缺陷创建时按严重度生成`deadline_at`期限。工程人员（dam_engineer）可提交延期申请，填写新的完成时间和原因；申请待审期间仍按原期限催办，负责人（emergency_manager）批准后期限才切换为新值，驳回则保留原期限。同一缺陷同时只能有一笔待审申请，重复提交返回冲突提示；申请人不能审批自己的申请；两人同时审批同一笔时只有一笔生效；已关闭的缺陷不再受理延期申请和审批。申请、审批结果和期限变化全部写入审计链。
 
 ## 测试
 

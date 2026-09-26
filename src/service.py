@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, NotFoundError, PermissionDenied,
+                     ValidationError, ensure_role, normalize_severity,
+                     parse_instant, require_deadline, require_number,
+                     require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY,
+                    EXTENSION_DECIDE_ROLES, EXTENSION_REQUEST_ROLES,
+                    RECORD_ROLES, TERMINAL_STATES, TITLE, VIEW_ROLES,
+                    completion_blockers, escalation_required, priority_score,
+                    response_deadline_hours, role_for_transition,
                     validate_transition)
 
 
@@ -34,7 +39,9 @@ class Service:
             "title": title, "severity": severity, "quantity": quantity,
             "priority": priority_score(severity, quantity, threshold),
         })
-        return self.enrich(item)
+        result = self.enrich(item)
+        result["pending_extension"] = None
+        return result
 
     def add_record(self, item_id: int, payload: Dict[str, Any], actor: str,
                    role: str) -> Dict[str, Any]:
@@ -65,7 +72,6 @@ class Service:
             raise ValueError("expected_version必须是正整数")
         blockers = completion_blockers(target, self.repository.open_record_count(item_id))
         if blockers:
-            from .domain import ConflictError
             raise ConflictError("；".join(blockers))
         updated = self.repository.transition_item(item_id, target, expected_version, actor)
         self.repository.append_audit("transition", ENTITY, item_id, actor, {
@@ -75,9 +81,58 @@ class Service:
         })
         return self.enrich(updated)
 
+    def request_extension(self, item_id: int, payload: Dict[str, Any], actor: str,
+                          role: str) -> Dict[str, Any]:
+        ensure_role(role, EXTENSION_REQUEST_ROLES)
+        actor = require_text(actor, "actor", 100)
+        new_deadline = require_deadline(payload.get("new_deadline"), "new_deadline")
+        reason = require_text(payload.get("reason"), "reason")
+        item = self.repository.get_item(item_id)
+        if item["status"] in TERMINAL_STATES:
+            raise ConflictError("缺陷已关闭，不再受理延期申请")
+        if parse_instant(new_deadline) <= parse_instant(item["deadline_at"]):
+            raise ValidationError("新的完成时间必须晚于当前期限")
+        request = self.repository.create_extension_request(item_id, new_deadline,
+                                                           reason, actor)
+        self.repository.append_audit("extension_request", ENTITY, item_id, actor, {
+            "request_id": request["id"], "new_deadline": new_deadline,
+            "reason": reason, "current_deadline": item["deadline_at"],
+        })
+        return request
+
+    def decide_extension(self, item_id: int, request_id: int, payload: Dict[str, Any],
+                         actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, EXTENSION_DECIDE_ROLES)
+        actor = require_text(actor, "actor", 100)
+        decision = payload.get("decision")
+        if decision not in ("approve", "reject"):
+            raise ValidationError("decision必须是approve或reject")
+        item = self.repository.get_item(item_id)
+        request = self.repository.get_extension_request(request_id)
+        if request["item_id"] != item_id:
+            raise NotFoundError("延期申请不存在")
+        if request["requested_by"] == actor:
+            raise PermissionDenied("申请人不能审批自己的延期申请")
+        updated = self.repository.decide_extension_request(
+            request_id, decision == "approve", actor)
+        self.repository.append_audit("extension_decision", ENTITY, item_id, actor, {
+            "request_id": request_id,
+            "decision": "approved" if decision == "approve" else "rejected",
+            "deadline_before": item["deadline_at"],
+            "deadline_after": (request["requested_deadline"]
+                               if decision == "approve" else item["deadline_at"]),
+        })
+        return updated
+
+    def list_extensions(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_extension_requests(item_id)
+
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)
-        return self.enrich(self.repository.get_item(item_id))
+        item = self.enrich(self.repository.get_item(item_id))
+        item["pending_extension"] = self.repository.pending_extension_request(item_id)
+        return item
 
     def list_items(self, role: str, status: Optional[str] = None) -> list:
         self._view(role)

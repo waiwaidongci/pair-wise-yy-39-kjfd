@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 class ErrorKind:
     VALIDATION="validation"; NOT_FOUND="not_found"; FORBIDDEN="forbidden"; CONFLICT="conflict"
@@ -36,3 +37,11 @@ def require_number(value,field,minimum=0.0):
     return number
 def ensure_role(role,allowed):
     if role not in allowed: raise PermissionDenied("当前角色无权执行该操作")
+def parse_instant(value):
+    try: return datetime.fromisoformat(str(value).replace("Z","+00:00"))
+    except ValueError: raise ValidationError("时间必须是ISO 8601格式")
+def require_deadline(value,field="new_deadline"):
+    text=require_text(value,field,100)
+    parsed=parse_instant(text)
+    if parsed.tzinfo is None: raise ValidationError(f"{field}必须包含时区信息")
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
