@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, NotFoundError, PermissionDenied,
+                     ValidationError, ensure_role, normalize_severity,
+                     require_number, require_text, require_timestamp)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, EXTENSION_APPLY_ROLES,
+                    EXTENSION_DECIDE_ROLES, RECORD_ROLES, TERMINAL_STATES,
+                    TITLE, VIEW_ROLES, completion_blockers, effective_deadline,
+                    escalation_required, priority_score,
+                    response_deadline_hours, role_for_transition,
                     validate_transition)
 
 
@@ -79,6 +84,67 @@ class Service:
         self._view(role)
         return self.enrich(self.repository.get_item(item_id))
 
+    def request_extension(self, item_id: int, payload: Dict[str, Any], actor: str,
+                          role: str) -> Dict[str, Any]:
+        ensure_role(role, EXTENSION_APPLY_ROLES)
+        actor = require_text(actor, "actor", 100)
+        item = self.repository.get_item(item_id)
+        if item["status"] in TERMINAL_STATES:
+            raise ConflictError("缺陷已关闭，不再受理延期申请")
+        reason = require_text(payload.get("reason"), "reason")
+        new_deadline = require_timestamp(
+            payload.get("requested_deadline"), "requested_deadline")
+        if new_deadline <= datetime.now(timezone.utc):
+            raise ValidationError("新的完成时间必须晚于当前时间")
+        current_deadline = effective_deadline(item)
+        if new_deadline <= datetime.fromisoformat(current_deadline):
+            raise ValidationError("新的完成时间必须晚于当前期限")
+        if self.repository.pending_extension(item_id) is not None:
+            raise ConflictError("该缺陷已有待审批的延期申请")
+        deadline_iso = new_deadline.isoformat()
+        request = self.repository.create_extension(item_id, deadline_iso, reason, actor)
+        self.repository.append_audit("extension_request", ENTITY, item_id, actor, {
+            "request_id": request["id"], "requested_deadline": deadline_iso,
+            "current_deadline": current_deadline, "reason": reason,
+        })
+        return request
+
+    def decide_extension(self, item_id: int, request_id: int, payload: Dict[str, Any],
+                         actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, EXTENSION_DECIDE_ROLES)
+        actor = require_text(actor, "actor", 100)
+        decision = payload.get("decision")
+        if decision not in ("approved", "rejected"):
+            raise ValidationError("decision必须是approved或rejected")
+        note = payload.get("note")
+        if note is not None:
+            note = require_text(note, "note")
+        item = self.repository.get_item(item_id)
+        if item["status"] in TERMINAL_STATES:
+            raise ConflictError("缺陷已关闭，延期申请不再受理")
+        request = self.repository.get_extension(request_id)
+        if request["item_id"] != item_id:
+            raise NotFoundError("延期申请不存在")
+        if request["requested_by"] == actor:
+            raise PermissionDenied("申请人不能审批自己的延期申请")
+        if request["status"] != "pending":
+            raise ConflictError("该申请已被处理")
+        current_deadline = effective_deadline(item)
+        updated = self.repository.decide_extension(request_id, decision, actor, note)
+        self.repository.append_audit("extension_decision", ENTITY, item_id, actor, {
+            "request_id": request_id, "decision": decision,
+            "requested_by": request["requested_by"],
+            "previous_deadline": current_deadline,
+            "new_deadline": (request["requested_deadline"]
+                             if decision == "approved" else current_deadline),
+            "note": note,
+        })
+        return updated
+
+    def list_extensions(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_extensions(item_id)
+
     def list_items(self, role: str, status: Optional[str] = None) -> list:
         self._view(role)
         return [self.enrich(item) for item in self.repository.list_items(status)]
@@ -100,4 +166,5 @@ class Service:
             item["severity"], item["quantity"], item["threshold"])
         result["escalation_required"] = escalation_required(
             item["severity"], item["quantity"], item["threshold"])
+        result["deadline_at"] = effective_deadline(item)
         return result

@@ -36,12 +36,29 @@ class Repository:
                     status TEXT NOT NULL CHECK(status IN ({statuses})),
                     version INTEGER NOT NULL DEFAULT 1,
                     external_ref TEXT,
+                    deadline_at TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_items_external_ref
                     ON items(external_ref) WHERE external_ref IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS extension_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    requested_deadline TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','approved','rejected')),
+                    requested_by TEXT NOT NULL,
+                    decided_by TEXT,
+                    decision_note TEXT,
+                    decided_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_extension_pending
+                    ON extension_requests(item_id) WHERE status='pending';
                 CREATE TABLE IF NOT EXISTS records (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
@@ -66,6 +83,10 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+            item_columns = {row["name"] for row in
+                            self.conn.execute("PRAGMA table_info(items)")}
+            if "deadline_at" not in item_columns:
+                self.conn.execute("ALTER TABLE items ADD COLUMN deadline_at TEXT")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -156,6 +177,75 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def create_extension(self, item_id: int, requested_deadline: str, reason: str,
+                         actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO extension_requests(item_id, requested_deadline, reason,
+                       status, requested_by, created_at, updated_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (item_id, requested_deadline, reason, "pending", actor, now, now),
+                )
+                request_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("该缺陷已有待审批的延期申请") from exc
+        return self.get_extension(request_id)
+
+    def get_extension(self, request_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM extension_requests WHERE id=?", (request_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("延期申请不存在")
+        return dict(row)
+
+    def list_extensions(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM extension_requests WHERE item_id=? ORDER BY id DESC",
+                (item_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def pending_extension(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM extension_requests WHERE item_id=? AND status='pending'",
+                (item_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def decide_extension(self, request_id: int, decision: str, actor: str,
+                         note: Optional[str]) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE extension_requests
+                   SET status=?, decided_by=?, decision_note=?, decided_at=?, updated_at=?
+                   WHERE id=? AND status='pending'""",
+                (decision, actor, note, now, now, request_id),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM extension_requests WHERE id=?", (request_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("延期申请不存在")
+                raise ConflictError("该申请已被处理，请刷新后重试")
+            if decision == "approved":
+                row = self.conn.execute(
+                    "SELECT item_id, requested_deadline FROM extension_requests WHERE id=?",
+                    (request_id,),
+                ).fetchone()
+                self.conn.execute(
+                    "UPDATE items SET deadline_at=?, version=version+1, updated_at=? WHERE id=?",
+                    (row["requested_deadline"], now, row["item_id"]),
+                )
+        return self.get_extension(request_id)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
